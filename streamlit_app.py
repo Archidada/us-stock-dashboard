@@ -2,7 +2,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 
 st.set_page_config(page_title="美股持倉訊號儀表板", layout="wide")
 
@@ -30,10 +30,17 @@ st.caption("邏輯參考台指 v3 / D2：EMA20 vs EMA60 + 布林 + ATR。僅供�
 def get_data(ticker):
     try:
         df = yf.download(ticker, period="6mo", interval="1d", progress=False, auto_adjust=True)
-        if df.empty:
+        if df is None or df.empty:
             return None
-        df = df.dropna()
-        # 計算指標
+
+        # 處理 yfinance 可能回傳 MultiIndex 的情況
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        df = df.dropna(subset=["Close"])
+        if len(df) < 60:
+            return None
+
         df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
         df["EMA60"] = df["Close"].ewm(span=60, adjust=False).mean()
         df["BB_mid"] = df["Close"].rolling(20).mean()
@@ -42,28 +49,33 @@ def get_data(ticker):
         df["BB_lower"] = df["BB_mid"] - 2 * df["BB_std"]
         df["ATR"] = (df["High"] - df["Low"]).rolling(14).mean()
         return df
-    except Exception as e:
+    except Exception:
         return None
 
 def check_signal(df):
     if df is None or len(df) < 60:
         return "資料不足", "—", "—"
-    last = df.iloc[-1]
-    prev = df.iloc[-2] if len(df) > 1 else last
 
-    ema20 = last["EMA20"]
-    ema60 = last["EMA60"]
-    close = last["Close"]
-    atr = last["ATR"]
-    bb_upper = last["BB_upper"]
-    bb_lower = last["BB_lower"]
+    last = df.iloc[-1]
+
+    # 強制轉成純數字，避免 Series 比較錯誤
+    def to_float(val):
+        if isinstance(val, (pd.Series, np.ndarray)):
+            return float(val.iloc[0] if hasattr(val, "iloc") else val[0])
+        return float(val)
+
+    ema20 = to_float(last["EMA20"])
+    ema60 = to_float(last["EMA60"])
+    close = to_float(last["Close"])
+    open_ = to_float(last["Open"])
+    atr = to_float(last["ATR"])
+    bb_upper = to_float(last["BB_upper"])
+    bb_lower = to_float(last["BB_lower"])
 
     trend = "多頭" if ema20 > ema60 else "空頭"
-    status = "空手"
 
-    # 簡化版多空條件（對齊原儀表板精神）
-    long_ok = ema20 > ema60 and close > bb_upper * 0.98 and (close - last["Open"]) > atr * 0.5
-    short_ok = ema20 < ema60 and close < bb_lower * 1.02 and (last["Open"] - close) > atr * 0.5
+    long_ok = (ema20 > ema60) and (close > bb_upper * 0.98) and ((close - open_) > atr * 0.5)
+    short_ok = (ema20 < ema60) and (close < bb_lower * 1.02) and ((open_ - close) > atr * 0.5)
 
     if long_ok:
         status = "可考慮做多"
@@ -78,19 +90,25 @@ def check_signal(df):
     return status, trend, f"多停損 ~{stop_long:.1f} / 空停損 ~{stop_short:.1f}"
 
 # 主畫面
-cols = st.columns([2, 1])
-with cols[0]:
+col1, col2 = st.columns([3, 1])
+with col1:
     st.subheader("即時訊號")
-with cols[1]:
+with col2:
     if st.button("重新整理"):
         st.cache_data.clear()
+        st.rerun()
 
 rows = []
 for ticker, shares in HOLDINGS.items():
     df = get_data(ticker)
     status, trend, stop = check_signal(df)
-    price = df["Close"].iloc[-1] if df is not None and not df.empty else None
-    value = price * shares if price else None
+
+    price = None
+    value = None
+    if df is not None and not df.empty:
+        price = float(df["Close"].iloc[-1])
+        value = price * shares
+
     rows.append({
         "標的": ticker,
         "股數": round(shares, 2),
@@ -113,4 +131,4 @@ st.markdown("""
 - 這不是投資建議，下單前請自行確認
 """)
 
-st.caption(f"最後更新：{datetime.now().strftime('%Y-%m-%d %H:%M')}（台灣時間視你的時區而定）")
+st.caption(f"最後更新：{datetime.now().strftime('%Y-%m-%d %H:%M')}")
