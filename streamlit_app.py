@@ -6,24 +6,30 @@ from datetime import datetime
 
 st.set_page_config(page_title="美股持倉訊號儀表板", layout="wide")
 
-HOLDINGS = {
-    "VOO": 7.82789,
-    "EPD": 95.39788,
-    "TSLA": 8.86216,
-    "VZ": 76.69738,
-    "O": 48.44974,
-    "JNJ": 9.32249,
-    "ARCC": 118.91823,
-    "PG": 9.85584,
-    "SCHP": 51.38192,
-    "GOOGL": 3.87485,
-    "SOXX": 2.05541,
-    "TSM": 1.34955,
+DEFAULT_HOLDINGS = {
+    "VOO": 7.82789, "EPD": 95.39788, "TSLA": 8.86216, "VZ": 76.69738,
+    "O": 48.44974, "JNJ": 9.32249, "ARCC": 118.91823, "PG": 9.85584,
+    "SCHP": 51.38192, "GOOGL": 3.87485, "SOXX": 2.05541, "TSM": 1.34955,
     "COHR": 1.40927,
 }
 
-st.title("美股持倉訊號儀表板（波段強化版）")
-st.caption("趨勢過濾 + 回檔進場 + 量能確認 + ATR 停損 + 簡易回測。僅供參考，非下單建議。")
+st.title("美股持倉訊號儀表板（v3 策略改版）")
+st.caption("參考 asinkk/txo-dashboard 的 v3 邏輯：突破 + 拉回進場、ATR 停損、Chandelier 移動停利。僅供參考。")
+
+st.subheader("監測標的")
+col_a, col_b = st.columns([3, 1])
+with col_a:
+    extra_input = st.text_input("額外監測股票（逗號分隔）", value="", placeholder="NVDA, META, AAPL")
+with col_b:
+    if st.button("重新整理", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+tickers_to_show = dict(DEFAULT_HOLDINGS)
+if extra_input.strip():
+    for t in extra_input.upper().replace(" ", "").split(","):
+        if t and t not in tickers_to_show:
+            tickers_to_show[t] = 0
 
 @st.cache_data(ttl=300)
 def get_data(ticker):
@@ -33,19 +39,22 @@ def get_data(ticker):
             return None
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        df = df.dropna(subset=["Close", "Volume"])
+        df = df.dropna(subset=["Close", "High", "Low", "Open", "Volume"])
         if len(df) < 80:
             return None
 
         df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
         df["EMA60"] = df["Close"].ewm(span=60, adjust=False).mean()
+        df["BB_mid"] = df["Close"].rolling(20).mean()
+        df["BB_std"] = df["Close"].rolling(20).std()
+        df["BB_upper"] = df["BB_mid"] + 2 * df["BB_std"]
+        df["BB_lower"] = df["BB_mid"] - 2 * df["BB_std"]
         df["ATR"] = (df["High"] - df["Low"]).rolling(14).mean()
-        df["Vol_MA20"] = df["Volume"].rolling(20).mean()
-        delta = df["Close"].diff()
-        gain = delta.where(delta > 0, 0).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rs = gain / loss.replace(0, np.nan)
-        df["RSI"] = 100 - (100 / (1 + rs))
+        ema12 = df["Close"].ewm(span=12, adjust=False).mean()
+        ema26 = df["Close"].ewm(span=26, adjust=False).mean()
+        macd = ema12 - ema26
+        signal = macd.ewm(span=9, adjust=False).mean()
+        df["MACD_hist"] = macd - signal
         return df
     except Exception:
         return None
@@ -53,169 +62,109 @@ def get_data(ticker):
 def to_float(val):
     if isinstance(val, (pd.Series, np.ndarray)):
         return float(val.iloc[0] if hasattr(val, "iloc") else val[0])
-    return float(val)
+    try:
+        return float(val)
+    except:
+        return np.nan
 
-def check_signal(df):
-    if df is None or len(df) < 60:
-        return "資料不足", "—", "—", "—", "—"
+def check_v3(df):
+    if df is None or len(df) < 65:
+        return "資料不足", "—", "—", "—"
 
-    last = df.iloc[-1]
-    ema20 = to_float(last["EMA20"])
-    ema60 = to_float(last["EMA60"])
-    close = to_float(last["Close"])
-    atr = to_float(last["ATR"])
-    vol = to_float(last["Volume"])
-    vol_ma = to_float(last["Vol_MA20"])
-    rsi = to_float(last["RSI"]) if not pd.isna(last["RSI"]) else 50
+    i = -1
+    row = df.iloc[i]
+    prev = df.iloc[i-1]
+
+    close = to_float(row["Close"])
+    open_ = to_float(row["Open"])
+    high = to_float(row["High"])
+    low = to_float(row["Low"])
+    ema20 = to_float(row["EMA20"])
+    ema60 = to_float(row["EMA60"])
+    atr = to_float(row["ATR"])
+    atr_prev = to_float(prev["ATR"])
+    bb_upper = to_float(row["BB_upper"])
+    macd_hist = to_float(row["MACD_hist"])
+    prev_high = to_float(prev["High"])
+
+    if any(np.isnan(x) for x in [close, ema20, ema60, atr]):
+        return "資料不足", "—", "—", "—"
 
     trend = "多頭" if ema20 > ema60 else "空頭"
-    dist = abs(close - ema20)
-    volume_ok = vol > vol_ma * 1.2
-    not_extended = dist < atr * 2
+    body = abs(close - open_)
+    rng = high - low if high > low else 0.01
+    body_ratio = body / rng
 
-    status = "空手 / 條件未觸發"
-    stop = "—"
-    rr = "—"
+    status = "空手"
+    stop_txt = "—"
+    detail = ""
 
-    if trend == "多頭" and not_extended and volume_ok and rsi > 40:
-        if abs(close - ema20) <= atr * 0.5:
-            status = "可考慮做多（回檔）"
-            stop_price = close - atr * 1.2
-            stop = f"停損 ~{stop_price:.1f}"
-            rr = "RR ≈ 1.67"
+    if trend == "多頭":
+        breakout = (
+            body_ratio >= 0.5 and
+            body >= 0.8 * atr_prev and
+            close > bb_upper and
+            macd_hist > 0
+        )
+        pullback = (
+            body_ratio >= 0.5 and
+            low <= ema20 and
+            close > ema20 and
+            close > prev_high and
+            ema60 > to_float(df.iloc[i-5]["EMA60"])
+        )
 
-    if trend == "空頭" and not_extended and volume_ok and rsi < 60:
-        if abs(close - ema20) <= atr * 0.5:
-            status = "可考慮做空（反彈）"
-            stop_price = close + atr * 1.2
-            stop = f"停損 ~{stop_price:.1f}"
-            rr = "RR ≈ 1.67"
+        if breakout:
+            status = "可考慮做多（突破）"
+            detail = "突破布林 + 實體夠強 + MACD正"
+        elif pullback:
+            status = "可考慮做多（拉回）"
+            detail = "回測 EMA20 後站回 + 破前高"
 
-    return status, trend, stop, rr, f"RSI {rsi:.0f}"
+        if status != "空手":
+            raw_stop_dist = close - (low - 0.1 * atr)
+            stop_dist = max(min(raw_stop_dist, 1.5 * atr), 0.5 * atr)
+            stop_price = close - stop_dist
+            stop_txt = f"停損 ~{stop_price:.1f}（約 {stop_dist:.1f} 點）"
 
-def simple_backtest(df, ticker):
-    if df is None or len(df) < 100:
-        return None
-    trades = []
-    position = None
+    return status, trend, stop_txt, detail
 
-    for i in range(60, len(df) - 1):
-        row = df.iloc[i]
-        close = to_float(row["Close"])
-        ema20 = to_float(row["EMA20"])
-        ema60 = to_float(row["EMA60"])
-        atr = to_float(row["ATR"])
-        vol = to_float(row["Volume"])
-        vol_ma = to_float(row["Vol_MA20"])
-        rsi = to_float(row["RSI"]) if not pd.isna(row["RSI"]) else 50
-
-        trend = "long" if ema20 > ema60 else "short"
-        volume_ok = vol > vol_ma * 1.2
-        near_ema = abs(close - ema20) <= atr * 0.5
-        not_extended = abs(close - ema20) < atr * 2
-
-        if position is None:
-            if trend == "long" and near_ema and volume_ok and not_extended and rsi > 40:
-                position = {"side": "long", "entry": close, "stop": close - atr*1.2, "target": close + atr*2.0, "entry_idx": i}
-            elif trend == "short" and near_ema and volume_ok and not_extended and rsi < 60:
-                position = {"side": "short", "entry": close, "stop": close + atr*1.2, "target": close - atr*2.0, "entry_idx": i}
-
-        if position is not None:
-            next_high = to_float(df.iloc[i+1]["High"])
-            next_low = to_float(df.iloc[i+1]["Low"])
-            next_close = to_float(df.iloc[i+1]["Close"])
-
-            hit = None
-            if position["side"] == "long":
-                if next_low <= position["stop"]:
-                    hit = position["stop"]
-                elif next_high >= position["target"]:
-                    hit = position["target"]
-            else:
-                if next_high >= position["stop"]:
-                    hit = position["stop"]
-                elif next_low <= position["target"]:
-                    hit = position["target"]
-
-            if hit is not None or (i - position["entry_idx"] > 15):
-                exit_price = hit if hit is not None else next_close
-                pnl = (exit_price - position["entry"]) if position["side"] == "long" else (position["entry"] - exit_price)
-                trades.append(pnl / position["entry"])
-                position = None
-
-    if not trades:
-        return {"trades": 0, "win_rate": 0, "avg_return": 0, "total_return": 0}
-
-    wins = [t for t in trades if t > 0]
-    return {
-        "trades": len(trades),
-        "win_rate": len(wins) / len(trades) * 100,
-        "avg_return": np.mean(trades) * 100,
-        "total_return": sum(trades) * 100,
-    }
-
-col1, col2 = st.columns([3, 1])
-with col1:
-    st.subheader("即時訊號")
-with col2:
-    if st.button("重新整理"):
-        st.cache_data.clear()
-        st.rerun()
+st.subheader("即時訊號（v3 邏輯）")
 
 rows = []
-backtest_rows = []
-
-for ticker, shares in HOLDINGS.items():
+for ticker, shares in tickers_to_show.items():
     df = get_data(ticker)
-    status, trend, stop, rr, rsi_txt = check_signal(df)
+    status, trend, stop, detail = check_v3(df)
 
     price = None
     value = None
     if df is not None and not df.empty:
-        price = float(df["Close"].iloc[-1])
-        value = price * shares
+        price = to_float(df["Close"].iloc[-1])
+        value = price * shares if shares > 0 else None
 
     rows.append({
         "標的": ticker,
-        "股數": round(shares, 2),
-        "現價": f"${price:.2f}" if price else "—",
+        "股數": round(shares, 2) if shares > 0 else "—",
+        "現價": f"${price:.2f}" if price and not np.isnan(price) else "—",
         "市值": f"${value:,.0f}" if value else "—",
         "趨勢": trend,
         "訊號": status,
-        "停損 / RR": f"{stop} | {rr}" if stop != "—" else "—",
-        "RSI": rsi_txt,
+        "停損": stop,
+        "說明": detail,
     })
-
-    bt = simple_backtest(df, ticker)
-    if bt:
-        backtest_rows.append({
-            "標的": ticker,
-            "交易次數": bt["trades"],
-            "勝率": f"{bt['win_rate']:.0f}%",
-            "平均報酬": f"{bt['avg_return']:.1f}%",
-            "累計報酬": f"{bt['total_return']:.1f}%",
-        })
 
 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-st.subheader("簡易回測（過去約 1 年）")
-st.caption("規則：趨勢方向 + 回檔到 EMA20 ± 0.5ATR + 量能放大 + RSI 過濾。停損 1.2ATR、停利 2ATR，最多持有 15 天。")
-if backtest_rows:
-    st.dataframe(pd.DataFrame(backtest_rows), use_container_width=True, hide_index=True)
-else:
-    st.info("回測資料不足")
-
 st.divider()
 st.markdown("""
-**波段強化條件**
-- 只做趨勢方向（EMA20 vs EMA60）
-- 回檔到 EMA20 ± 0.5 ATR 才進場
-- 成交量 > 20 日均量 1.2 倍
-- 價格離 EMA20 不超過 2 ATR
-- RSI 過濾（多頭 >40、空頭 <60）
-- 停損 1.2 ATR、停利 2 ATR
+**v3 改版條件（參考 asinkk）**
+- 趨勢：EMA20 > EMA60 才考慮做多
+- **突破**：實體 ≥ 高低差 50%、實體 ≥ 0.8 ATR、收盤破布林上軌、MACD 柱狀圖 > 0
+- **拉回**：實體 ≥ 50%、低點觸及 EMA20、收盤站回 EMA20、收盤破前高、EMA60 近 5 根上升
+- 停損：以當根極值為基準，0.5～1.5 ATR
+- 出場建議：Chandelier 移動停利（最高點 - 5 ATR），或獲利 1R 後保本
 
-**注意**：回測為簡化模擬，未計入手續費、滑價與隔夜跳空，僅供參考規則品質。
+**注意**：這是日線版本，僅供觀察，不是下單指令。
 """)
 
 st.caption(f"最後更新：{datetime.now().strftime('%Y-%m-%d %H:%M')}")
